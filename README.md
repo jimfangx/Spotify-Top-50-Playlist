@@ -21,17 +21,19 @@ The cron path is:
 
 Copy `.env.example` to `.env` for local development and set the same values in your host:
 
-- `MONGODB_URI`: MongoDB Atlas connection string.
+- `MONGODB_URI` or `MONGOURI`: MongoDB Atlas connection string.
 - `MONGODB_DB_NAME`: Defaults to `spotifytop50DB`.
 - `MONGODB_AUTH_COLLECTION`: Defaults to `auth`.
 - `MONGODB_TRACKS_COLLECTION`: Defaults to `top_tracks`.
 - `SPOTIFY_CLIENT_ID`: Spotify app client ID.
-- `SPOTIFY_CLIENT_SECRET`: Spotify app client secret.
+- `SPOTIFY_CLIENT_SECRET` or `SPOTIFYSECRET`: Spotify app client secret.
 - `SPOTIFY_REDIRECT_URI`: Exact callback URL registered in Spotify, for example `https://your-app.vercel.app/callback`.
-- `SPOTIFY_PLAYLIST_ID`: Destination playlist ID.
+- `SPOTIFY_PLAYLIST_ID` or `PLAYLISTID`: Destination playlist ID.
 - `SPOTIFY_TOP_TRACKS_TIME_RANGE`: `short_term`, `medium_term`, or `long_term`. Defaults to `short_term`.
 - `SPOTIFY_TOP_TRACKS_LIMIT`: Defaults to `50`.
 - `UPDATE_SECRET`: Long random token required by `/update`.
+
+Legacy note: `URIDOCID` is no longer used. The app now stores the latest top tracks in `MONGODB_TRACKS_COLLECTION` with `_id: "latest"`.
 
 ## Local Setup
 

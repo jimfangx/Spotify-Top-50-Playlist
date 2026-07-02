@@ -42,11 +42,15 @@ class ConfigurationError extends Error {
   }
 }
 
-function requiredEnv(name) {
-  const value = process.env[name];
+function envValue(...names) {
+  return names.map((name) => process.env[name]).find(Boolean);
+}
+
+function requiredEnv(...names) {
+  const value = envValue(...names);
 
   if (!value) {
-    throw new ConfigurationError(`Missing required environment variable: ${name}`);
+    throw new ConfigurationError(`Missing required environment variable. Set one of: ${names.join(', ')}`);
   }
 
   return value;
@@ -57,11 +61,11 @@ function getSpotifyClientId() {
 }
 
 function getSpotifyClientSecret() {
-  return requiredEnv('SPOTIFY_CLIENT_SECRET');
+  return requiredEnv('SPOTIFY_CLIENT_SECRET', 'SPOTIFYSECRET');
 }
 
 function getPlaylistId() {
-  return requiredEnv('SPOTIFY_PLAYLIST_ID');
+  return requiredEnv('SPOTIFY_PLAYLIST_ID', 'PLAYLISTID');
 }
 
 function getUpdateSecret() {
@@ -70,7 +74,7 @@ function getUpdateSecret() {
 
 function getMongoClient() {
   if (!mongoUri) {
-    throw new ConfigurationError('Missing required environment variable: MONGODB_URI');
+    throw new ConfigurationError('Missing required environment variable. Set one of: MONGODB_URI, MONGOURI');
   }
 
   if (!mongoClientPromise) {

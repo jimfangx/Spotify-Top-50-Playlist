@@ -1,13 +1,18 @@
-name: Nightly-minute-cron
+name: Update Spotify Top 50 Playlist
+
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
 jobs:
-  cron:
+  update:
     runs-on: ubuntu-latest
     steps:
-      - name: Call our API route
+      - name: Call update endpoint
         run: |
-          curl --location --request GET 'https://spotify-top-50-playlist.vercel.app/refresh_token'
-          sleep 5
-          curl --location --request GET 'https://spotify-top-50-playlist.vercel.app/update'
+          curl --fail --request POST "$UPDATE_URL" \
+            --header "Authorization: Bearer $UPDATE_SECRET"
+        env:
+          UPDATE_URL: ${{ secrets.UPDATE_URL }}
+          UPDATE_SECRET: ${{ secrets.UPDATE_SECRET }}

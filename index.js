@@ -1,244 +1,526 @@
-const mode = 'prod'
-if (mode === 'dev') {
-    require('dotenv').config({ path: '.env' })
-}
-var express = require('express'); // Express web server framework
-var axios = require('axios');
-var cors = require('cors');
-var qs = require('qs');
-var cookieParser = require('cookie-parser');
-const { ObjectId } = require('mongodb');
-const MongoClient = require('mongodb').MongoClient
-const database = new MongoClient(process.env.MONGOURI, { useNewUrlParser: true, useUnifiedTopology: true })
+const crypto = require('crypto');
+const path = require('path');
+const express = require('express');
+const axios = require('axios');
+const cookieParser = require('cookie-parser');
+const { MongoClient } = require('mongodb');
 
-
-var client_id = 'd650f5c65de24114a7e99a283bf9e002'; // Your client id
-var client_secret = process.env.SPOTIFYSECRET; // Your secret
-if (mode === 'prod') {
-    var redirect_uri = 'http://spotify-top-50-playlist.vercel.app/callback'; // Your redirect uri
-} else {
-    var redirect_uri = 'http://localhost:8080/callback'; // Your redirect uri
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config({ path: '.env' });
 }
 
+const app = express();
 
-/**
- * Generates a random string containing numbers and letters
- * @param  {number} length The length of the string
- * @return {string} The generated string
- */
-var generateRandomString = function (length) {
-    var text = '';
-    var possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+app.set('trust proxy', 1);
+app.use(express.json());
+app.use(cookieParser());
+app.use(express.static(path.join(__dirname, 'public')));
 
-    for (var i = 0; i < length; i++) {
-        text += possible.charAt(Math.floor(Math.random() * possible.length));
-    }
-    return text;
-};
+const stateCookieName = 'spotify_auth_state';
+const scopes = [
+  'user-top-read',
+  'playlist-modify-public',
+  'playlist-modify-private',
+];
 
-var stateKey = 'spotify_auth_state';
+const mongoUri = process.env.MONGODB_URI || process.env.MONGOURI;
+const mongoDbName = process.env.MONGODB_DB_NAME || 'spotifytop50DB';
+const authCollectionName = process.env.MONGODB_AUTH_COLLECTION || 'auth';
+const tracksCollectionName = process.env.MONGODB_TRACKS_COLLECTION || 'top_tracks';
+const authDocumentId = 'spotify';
+const latestTracksDocumentId = 'latest';
+const spotifyApiBaseUrl = 'https://api.spotify.com/v1';
+const spotifyAccountsBaseUrl = 'https://accounts.spotify.com';
 
-var app = express();
+let mongoClientPromise;
 
-app.use(express.static(__dirname + '/public'))
-    .use(cors())
-    .use(cookieParser());
+class ConfigurationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ConfigurationError';
+    this.statusCode = 500;
+  }
+}
 
-app.get('/login', function (req, res) {
+function requiredEnv(name) {
+  const value = process.env[name];
 
-    var state = generateRandomString(16);
-    res.cookie(stateKey, state);
+  if (!value) {
+    throw new ConfigurationError(`Missing required environment variable: ${name}`);
+  }
 
-    // your application requests authorization
-    var scope = 'playlist-modify-public playlist-modify-private user-top-read';
-    res.redirect('https://accounts.spotify.com/authorize?' +
-        qs.stringify({
-            response_type: 'code',
-            client_id: client_id,
-            scope: scope,
-            redirect_uri: redirect_uri,
-            state: state
-        }));
+  return value;
+}
+
+function getSpotifyClientId() {
+  return requiredEnv('SPOTIFY_CLIENT_ID');
+}
+
+function getSpotifyClientSecret() {
+  return requiredEnv('SPOTIFY_CLIENT_SECRET');
+}
+
+function getPlaylistId() {
+  return requiredEnv('SPOTIFY_PLAYLIST_ID');
+}
+
+function getUpdateSecret() {
+  return requiredEnv('UPDATE_SECRET');
+}
+
+function getMongoClient() {
+  if (!mongoUri) {
+    throw new ConfigurationError('Missing required environment variable: MONGODB_URI');
+  }
+
+  if (!mongoClientPromise) {
+    const client = new MongoClient(mongoUri);
+    mongoClientPromise = client.connect();
+  }
+
+  return mongoClientPromise;
+}
+
+async function getDb() {
+  const client = await getMongoClient();
+  return client.db(mongoDbName);
+}
+
+function getRedirectUri(req) {
+  if (process.env.SPOTIFY_REDIRECT_URI) {
+    return process.env.SPOTIFY_REDIRECT_URI;
+  }
+
+  return `${req.protocol}://${req.get('host')}/callback`;
+}
+
+function getBasicAuthorizationHeader() {
+  const credentials = `${getSpotifyClientId()}:${getSpotifyClientSecret()}`;
+  return `Basic ${Buffer.from(credentials).toString('base64')}`;
+}
+
+function getRefreshTokenExpiry(authorizedAt) {
+  const expiry = new Date(authorizedAt);
+  expiry.setMonth(expiry.getMonth() + 6);
+  return expiry;
+}
+
+function getAccessTokenExpiry(expiresInSeconds) {
+  return new Date(Date.now() + expiresInSeconds * 1000);
+}
+
+function isAccessTokenFresh(authDoc) {
+  if (!authDoc || !authDoc.access_token || !authDoc.expires_at) {
+    return false;
+  }
+
+  return new Date(authDoc.expires_at).getTime() - Date.now() > 5 * 60 * 1000;
+}
+
+function daysUntil(date) {
+  if (!date) {
+    return null;
+  }
+
+  return Math.ceil((new Date(date).getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+}
+
+function buildAuthStatus(authDoc) {
+  const refreshTokenDaysRemaining = authDoc
+    ? daysUntil(authDoc.refresh_token_expires_at)
+    : null;
+
+  return {
+    authorized: Boolean(authDoc && authDoc.refresh_token),
+    access_token_expires_at: authDoc && authDoc.expires_at,
+    refresh_token_expires_at: authDoc && authDoc.refresh_token_expires_at,
+    refresh_token_days_remaining: refreshTokenDaysRemaining,
+    reauthorization_recommended:
+      refreshTokenDaysRemaining !== null && refreshTokenDaysRemaining <= 30,
+    scope: authDoc && authDoc.scope,
+  };
+}
+
+function timingSafeEquals(left, right) {
+  const leftBuffer = Buffer.from(left || '');
+  const rightBuffer = Buffer.from(right || '');
+
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function requireUpdateAuthorization(req) {
+  const expectedSecret = getUpdateSecret();
+  const authHeader = req.get('authorization') || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  const suppliedSecret = bearerToken || req.query.secret || '';
+
+  if (!timingSafeEquals(suppliedSecret, expectedSecret)) {
+    const error = new Error('Unauthorized');
+    error.statusCode = 401;
+    throw error;
+  }
+}
+
+async function getAuthCollection() {
+  const db = await getDb();
+  return db.collection(authCollectionName);
+}
+
+async function getTracksCollection() {
+  const db = await getDb();
+  return db.collection(tracksCollectionName);
+}
+
+async function readAuthDocument() {
+  const collection = await getAuthCollection();
+  const modernDoc = await collection.findOne({ _id: authDocumentId });
+
+  if (modernDoc) {
+    return modernDoc;
+  }
+
+  const legacyDoc = await collection.findOne({ token_type: 'Bearer' });
+
+  if (!legacyDoc) {
+    return null;
+  }
+
+  const { _id: legacyId, ...legacyAuthFields } = legacyDoc;
+  const migratedDoc = {
+    ...legacyAuthFields,
+    expires_at: legacyDoc.expires_at || (legacyDoc.exp ? new Date(legacyDoc.exp) : null),
+    migrated_from_legacy_doc_id: legacyId,
+    updated_at: new Date(),
+  };
+
+  await collection.updateOne(
+    { _id: authDocumentId },
+    {
+      $set: migratedDoc,
+      $setOnInsert: { _id: authDocumentId },
+    },
+    { upsert: true },
+  );
+
+  return { ...migratedDoc, _id: authDocumentId };
+}
+
+async function saveAuthDocument(tokenResponse, existingAuthDoc = {}) {
+  const collection = await getAuthCollection();
+  const now = new Date();
+  const authorizedAt = existingAuthDoc.authorized_at || now;
+  const refreshToken = tokenResponse.refresh_token || existingAuthDoc.refresh_token;
+
+  const authDoc = {
+    access_token: tokenResponse.access_token,
+    refresh_token: refreshToken,
+    token_type: tokenResponse.token_type,
+    scope: tokenResponse.scope || existingAuthDoc.scope,
+    expires_in: tokenResponse.expires_in,
+    expires_at: getAccessTokenExpiry(tokenResponse.expires_in),
+    refresh_token_expires_at:
+      existingAuthDoc.refresh_token_expires_at || getRefreshTokenExpiry(authorizedAt),
+    authorized_at: authorizedAt,
+    updated_at: now,
+  };
+
+  await collection.updateOne(
+    { _id: authDocumentId },
+    {
+      $set: authDoc,
+      $setOnInsert: { _id: authDocumentId },
+    },
+    { upsert: true },
+  );
+
+  return { ...authDoc, _id: authDocumentId };
+}
+
+async function exchangeCodeForTokens(code, redirectUri) {
+  const body = new URLSearchParams({
+    code,
+    redirect_uri: redirectUri,
+    grant_type: 'authorization_code',
+  });
+
+  const response = await axios.post(`${spotifyAccountsBaseUrl}/api/token`, body.toString(), {
+    headers: {
+      Authorization: getBasicAuthorizationHeader(),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  });
+
+  return saveAuthDocument(response.data, { authorized_at: new Date() });
+}
+
+async function refreshAccessToken(authDoc) {
+  if (!authDoc || !authDoc.refresh_token) {
+    const error = new Error('Spotify authorization is missing. Visit /login first.');
+    error.statusCode = 428;
+    throw error;
+  }
+
+  if (
+    authDoc.refresh_token_expires_at
+    && new Date(authDoc.refresh_token_expires_at).getTime() <= Date.now()
+  ) {
+    const error = new Error('Spotify refresh token expired. Visit /login to reauthorize.');
+    error.statusCode = 428;
+    throw error;
+  }
+
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: authDoc.refresh_token,
+  });
+
+  const response = await axios.post(`${spotifyAccountsBaseUrl}/api/token`, body.toString(), {
+    headers: {
+      Authorization: getBasicAuthorizationHeader(),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  });
+
+  return saveAuthDocument(response.data, authDoc);
+}
+
+async function getValidAccessToken() {
+  const authDoc = await readAuthDocument();
+
+  if (isAccessTokenFresh(authDoc)) {
+    return authDoc.access_token;
+  }
+
+  const refreshedAuthDoc = await refreshAccessToken(authDoc);
+  return refreshedAuthDoc.access_token;
+}
+
+async function spotifyRequest(accessToken, config) {
+  const response = await axios({
+    baseURL: spotifyApiBaseUrl,
+    ...config,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      ...(config.headers || {}),
+    },
+  });
+
+  return response.data;
+}
+
+function normalizeTrack(track, index) {
+  return {
+    rank: index + 1,
+    id: track.id,
+    uri: track.uri,
+    name: track.name,
+    artists: (track.artists || []).map((artist) => ({
+      id: artist.id,
+      name: artist.name,
+      uri: artist.uri,
+      external_url: artist.external_urls && artist.external_urls.spotify,
+    })),
+    album: track.album
+      ? {
+        id: track.album.id,
+        name: track.album.name,
+        uri: track.album.uri,
+        external_url: track.album.external_urls && track.album.external_urls.spotify,
+        images: track.album.images || [],
+      }
+      : null,
+    external_url: track.external_urls && track.external_urls.spotify,
+    duration_ms: track.duration_ms,
+    explicit: track.explicit,
+  };
+}
+
+async function fetchTopTracks(accessToken) {
+  const timeRange = process.env.SPOTIFY_TOP_TRACKS_TIME_RANGE || 'short_term';
+  const limit = Number(process.env.SPOTIFY_TOP_TRACKS_LIMIT || 50);
+
+  if (!['short_term', 'medium_term', 'long_term'].includes(timeRange)) {
+    throw new ConfigurationError('SPOTIFY_TOP_TRACKS_TIME_RANGE must be short_term, medium_term, or long_term');
+  }
+
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+    throw new ConfigurationError('SPOTIFY_TOP_TRACKS_LIMIT must be an integer from 1 to 50');
+  }
+
+  const data = await spotifyRequest(accessToken, {
+    method: 'get',
+    url: '/me/top/tracks',
+    params: {
+      time_range: timeRange,
+      limit,
+      offset: 0,
+    },
+  });
+
+  const tracks = (data.items || [])
+    .filter((track) => track && track.type === 'track' && track.uri)
+    .map(normalizeTrack);
+
+  if (tracks.length === 0) {
+    const error = new Error('Spotify returned zero top tracks.');
+    error.statusCode = 502;
+    throw error;
+  }
+
+  return {
+    source: '/me/top/tracks',
+    time_range: timeRange,
+    requested_limit: limit,
+    total: data.total,
+    uris: tracks.map((track) => track.uri),
+    tracks,
+    updated_at: new Date(),
+  };
+}
+
+async function saveTopTracks(topTracksDocument) {
+  const collection = await getTracksCollection();
+
+  await collection.updateOne(
+    { _id: latestTracksDocumentId },
+    {
+      $set: topTracksDocument,
+      $setOnInsert: { _id: latestTracksDocumentId },
+    },
+    { upsert: true },
+  );
+
+  return collection.findOne({ _id: latestTracksDocumentId });
+}
+
+async function replacePlaylistItems(accessToken, uris) {
+  return spotifyRequest(accessToken, {
+    method: 'put',
+    url: `/playlists/${getPlaylistId()}/items`,
+    data: {
+      uris,
+    },
+  });
+}
+
+async function updateTopTracksPlaylist() {
+  const accessToken = await getValidAccessToken();
+  const topTracksDocument = await fetchTopTracks(accessToken);
+  const savedTracksDocument = await saveTopTracks(topTracksDocument);
+  const playlistResponse = await replacePlaylistItems(accessToken, savedTracksDocument.uris);
+  const authDoc = await readAuthDocument();
+
+  return {
+    updated_at: savedTracksDocument.updated_at,
+    track_count: savedTracksDocument.uris.length,
+    playlist_snapshot_id: playlistResponse.snapshot_id,
+    auth: buildAuthStatus(authDoc),
+  };
+}
+
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+app.get('/login', (req, res) => {
+  const state = crypto.randomBytes(16).toString('hex');
+  const redirectUri = getRedirectUri(req);
+
+  res.cookie(stateCookieName, state, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: req.secure,
+    maxAge: 10 * 60 * 1000,
+  });
+
+  const authUrl = new URL(`${spotifyAccountsBaseUrl}/authorize`);
+  authUrl.search = new URLSearchParams({
+    response_type: 'code',
+    client_id: getSpotifyClientId(),
+    scope: scopes.join(' '),
+    redirect_uri: redirectUri,
+    state,
+    show_dialog: req.query.force === 'true' ? 'true' : 'false',
+  }).toString();
+
+  res.redirect(authUrl.toString());
 });
 
-app.get('/callback', function (req, res) {
+app.get('/callback', asyncRoute(async (req, res) => {
+  const { code, error, state } = req.query;
+  const storedState = req.cookies ? req.cookies[stateCookieName] : null;
 
-    // your application requests refresh and access tokens
-    // after checking the state parameter
+  if (error) {
+    res.status(400).send(`Spotify authorization failed: ${error}`);
+    return;
+  }
 
-    var code = req.query.code || null;
-    var state = req.query.state || null;
-    var storedState = req.cookies ? req.cookies[stateKey] : null;
+  if (!code || !state || !storedState || state !== storedState) {
+    res.status(400).send('Spotify authorization failed: state mismatch.');
+    return;
+  }
 
-    if (state === null || state !== storedState) {
-        res.redirect('/#' +
-            qs.stringify({
-                error: 'state_mismatch'
-            }));
-    } else {
-        res.clearCookie(stateKey);
+  res.clearCookie(stateCookieName);
+  await exchangeCodeForTokens(code, getRedirectUri(req));
+  res.redirect('/?auth=success');
+}));
 
-        var callbackData = qs.stringify({
-            code: code,
-            grant_type: 'authorization_code',
-            redirect_uri: redirect_uri
-        })
+app.post('/update', asyncRoute(async (req, res) => {
+  requireUpdateAuthorization(req);
+  const result = await updateTopTracksPlaylist();
+  res.status(200).json({ ok: true, ...result });
+}));
 
-        var callbackConfig = {
-            method: 'post',
-            url: 'https://accounts.spotify.com/api/token',
-            headers: {
-                'Authorization': 'Basic ' + (Buffer.from(client_id + ':' + client_secret).toString('base64')),
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            data: callbackData
-        }
+app.get('/update', asyncRoute(async (req, res) => {
+  requireUpdateAuthorization(req);
+  const result = await updateTopTracksPlaylist();
+  res.status(200).json({ ok: true, ...result });
+}));
 
-        axios(callbackConfig)
-            .then(async function (response) {
-                var writeData = response.data
-                var access_token = response.data.access_token,
-                    refresh_token = response.data.refresh_token;
-                writeData.exp = new Date().getTime() + (response.data.expires_in * 1000)
-                database.connect(async (err, dbClient) => {
-                    if (err) console.error(err)
-                    const collection = dbClient.db('spotifytop50DB').collection('auth')
-                    await collection.updateOne({ token_type: "Bearer" }, { $set: writeData })
-                    database.close()
-                })
+app.get('/auth/status', asyncRoute(async (req, res) => {
+  const authDoc = await readAuthDocument();
 
-                // we can also pass the token to the browser to make requests from there - hiding this as of now so people dont take the account token.
-                res.redirect('/#' +
-                    qs.stringify({
-                        access_token: access_token,
-                        refresh_token: refresh_token
-                    }));
+  res.status(200).json(buildAuthStatus(authDoc));
+}));
 
-            })
-            .catch(function (error) {
-                console.log(error)
-                res.redirect('/#' +
-                    qs.stringify({
-                        error: 'invalid_token'
-                    }));
-            });
-    }
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true });
 });
 
-app.get('/refresh_token', function (req, res) {
-    // function refreshToken(refresh_token) {
-    // requesting access token from refresh token
-    // return new Promise((resolve, reject) => {
-    database.connect(async (err, dbClient) => {
-        var collectionFind = await dbClient.db('spotifytop50DB').collection('auth').find({ token_type: "Bearer" }).toArray()
-        collectionFind = collectionFind[0]
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
 
-        var refreshData = qs.stringify({
-            grant_type: 'refresh_token',
-            refresh_token: collectionFind.refresh_token
-        })
+  const statusCode = err.statusCode || (err.response && err.response.status) || 500;
+  const spotifyError = err.response && err.response.data;
 
+  console.error({
+    message: err.message,
+    statusCode,
+    spotifyError,
+  });
 
-        var config = {
-            method: 'post',
-            url: 'https://accounts.spotify.com/api/token',
-            headers: {
-                'Authorization': 'Basic ' + (Buffer.from(client_id + ':' + client_secret).toString('base64')),
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            data: refreshData
-        };
+  res.status(statusCode).json({
+    ok: false,
+    error: err.message,
+    spotify_error: spotifyError,
+  });
+});
 
-        axios(config)
-            .then(async function (response) {
-                console.log(JSON.stringify(response.data));
-                var writeData = response.data
-                writeData.exp = new Date().getTime() + (response.data.expires_in * 1000)
-                // await fs.writeFile('auth.json', JSON.stringify(response.data))
-                database.connect(async (err, dbClient) => {
-                    if (err) console.error(err)
-                    const collection = dbClient.db('spotifytop50DB').collection('auth')
-                    await collection.updateOne({ token_type: "Bearer" }, { $set: writeData })
-                    database.close()
-                    res.sendStatus(200)
-                })
-            })
-            .catch(function (error) {
-                console.log(error);
-            });
-        // })
-        database.close()
-    })
-})
+module.exports = app;
 
-app.get('/update', (err, res) => {
-    database.connect(async (err, dbClient) => {
-        var collectionFind = await dbClient.db('spotifytop50DB').collection('auth').find({ token_type: "Bearer" }).toArray()
-        collectionFind = collectionFind[0]
-        // check if token has expired, if yes, call refreshToken
-        if (collectionFind.exp < Date.now()) { // token has expired
-            // call refreshToken to refresh token
-            await refreshToken(collectionFind.refresh_token)
-        }
-        exec()
-
-        function exec() {
-            var getTop50 = {
-                method: 'get',
-                url: 'https://api.spotify.com/v1/me/top/tracks?time_range=short_term&limit=50&offset=0',
-                headers: {
-                    'Authorization': `Bearer ${collectionFind.access_token}`
-                }
-            }
-            axios(getTop50).then(async function (top50response) {
-                // check uri db and call https://developer.spotify.com/console/delete-playlist-tracks/ to delete all tracks in playlist
-                var uriCollectionFind = await dbClient.db('spotifytop50DB').collection('uris').find({ _id: ObjectId(process.env.URIDOCID) }).toArray()
-                uriCollectionFind = uriCollectionFind[0].arr
-                if (uriCollectionFind !== '') { // uris exist, delete all tracks in playlist
-                    console.log('deleting all tracks in playlist')
-                    // assemble uri array
-                    var rawPayload = {
-                        "tracks": []
-                    }
-
-                    for (var i = 0; i < uriCollectionFind.length; i++) {
-                        rawPayload.tracks.push({ "uri": uriCollectionFind[i] })
-                    }
-
-                    var deleteOldList = {
-                        method: 'delete',
-                        url: `https://api.spotify.com/v1/playlists/${process.env.PLAYLISTID}/tracks`, // regex the playlist id out later
-                        headers: {
-                            'Authorization': `Bearer ${collectionFind.access_token}`
-                        },
-                        data: JSON.stringify(rawPayload)
-                    }
-                    var deleteOldListResponse = await axios(deleteOldList)
-                    console.log(JSON.stringify(deleteOldListResponse.data))
-                }
-                // write to uris to file, for deletion later on
-                var uriArr = top50response.data.items.map(item => item.uri)
-                const collectionURI = dbClient.db('spotifytop50DB').collection('uris')
-
-                await collectionURI.insertOne({ arr: uriArr, expireAt: new Date()})
-
-                // https://developer.spotify.com/console/put-playlist-tracks/ - call this with the playlist id from the share link...
-                var addToList = {
-                    method: 'put',
-                    url: `https://api.spotify.com/v1/playlists/${process.env.PLAYLISTID}/tracks?uris=${uriArr.join(',')}`,
-                    headers: {
-                        'Authorization': `Bearer ${collectionFind.access_token}`
-                    }
-                }
-                var addToListResponse = await axios(addToList)
-                console.log(JSON.stringify(addToListResponse.data));
-                res.sendStatus(200) // send 200
-            }).catch(function (error) {
-                console.log(error);
-            });
-        }
-    })
-})
-app.listen(8080, () => {
-    console.log(`Listening at http://localhost:${8080}`)
-})
+if (require.main === module) {
+  const port = process.env.PORT || 8080;
+  app.listen(port, () => {
+    console.log(`Listening at http://localhost:${port}`);
+  });
+}

@@ -35,6 +35,8 @@ Copy `.env.example` to `.env` for local development and set the same values in y
 
 Legacy note: `URIDOCID` is no longer used. The app now stores the latest top tracks in `MONGODB_TRACKS_COLLECTION` with `_id: "latest"`.
 
+If `/login` reports a missing client ID after deployment, open `/config/status`. It reports whether required env vars are visible to the deployed runtime without exposing secret values. The app can temporarily fall back to the original public client ID from this repo, but you should still set `SPOTIFY_CLIENT_ID` in the deployment environment.
+
 ## Local Setup
 
 ```bash
@@ -105,6 +107,7 @@ jobs:
 - `GET /login?force=true`: Force a fresh authorization prompt.
 - `GET /callback`: Spotify OAuth callback.
 - `GET /auth/status`: Check token expiration metadata.
+- `GET /config/status`: Check whether deployment env vars are visible.
 - `POST /update`: Protected cron endpoint.
 - `GET /update`: Protected fallback for schedulers that cannot send `POST`.
 - `GET /health`: Health check.

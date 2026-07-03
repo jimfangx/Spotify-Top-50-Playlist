@@ -31,6 +31,7 @@ const authDocumentId = 'spotify';
 const latestTracksDocumentId = 'latest';
 const spotifyApiBaseUrl = 'https://api.spotify.com/v1';
 const spotifyAccountsBaseUrl = 'https://accounts.spotify.com';
+const legacyPublicSpotifyClientId = 'd650f5c65de24114a7e99a283bf9e002';
 
 let mongoClientPromise;
 
@@ -57,7 +58,8 @@ function requiredEnv(...names) {
 }
 
 function getSpotifyClientId() {
-  return requiredEnv('SPOTIFY_CLIENT_ID');
+  return envValue('SPOTIFY_CLIENT_ID', 'SPOTIFYCLIENTID', 'SPOTIFY_CLIENTID')
+    || legacyPublicSpotifyClientId;
 }
 
 function getSpotifyClientSecret() {
@@ -145,6 +147,26 @@ function buildAuthStatus(authDoc) {
   };
 }
 
+function buildConfigStatus() {
+  return {
+    mongo_uri_configured: Boolean(envValue('MONGODB_URI', 'MONGOURI')),
+    spotify_client_id_configured: Boolean(envValue(
+      'SPOTIFY_CLIENT_ID',
+      'SPOTIFYCLIENTID',
+      'SPOTIFY_CLIENTID',
+    )),
+    spotify_client_id_using_legacy_fallback: !Boolean(envValue(
+      'SPOTIFY_CLIENT_ID',
+      'SPOTIFYCLIENTID',
+      'SPOTIFY_CLIENTID',
+    )),
+    spotify_client_secret_configured: Boolean(envValue('SPOTIFY_CLIENT_SECRET', 'SPOTIFYSECRET')),
+    spotify_redirect_uri_configured: Boolean(envValue('SPOTIFY_REDIRECT_URI')),
+    playlist_id_configured: Boolean(envValue('SPOTIFY_PLAYLIST_ID', 'PLAYLISTID')),
+    update_secret_configured: Boolean(envValue('UPDATE_SECRET')),
+  };
+}
+
 function timingSafeEquals(left, right) {
   const leftBuffer = Buffer.from(left || '');
   const rightBuffer = Buffer.from(right || '');
@@ -184,6 +206,24 @@ async function readAuthDocument() {
   const modernDoc = await collection.findOne({ _id: authDocumentId });
 
   if (modernDoc) {
+    if (modernDoc.refresh_token && !modernDoc.refresh_token_expires_at) {
+      const authorizedAt = modernDoc.authorized_at || modernDoc.updated_at || new Date();
+      modernDoc.authorized_at = authorizedAt;
+      modernDoc.refresh_token_expires_at = getRefreshTokenExpiry(authorizedAt);
+      modernDoc.updated_at = new Date();
+
+      await collection.updateOne(
+        { _id: authDocumentId },
+        {
+          $set: {
+            authorized_at: modernDoc.authorized_at,
+            refresh_token_expires_at: modernDoc.refresh_token_expires_at,
+            updated_at: modernDoc.updated_at,
+          },
+        },
+      );
+    }
+
     return modernDoc;
   }
 
@@ -194,9 +234,13 @@ async function readAuthDocument() {
   }
 
   const { _id: legacyId, ...legacyAuthFields } = legacyDoc;
+  const authorizedAt = legacyDoc.authorized_at || legacyDoc.updated_at || new Date();
   const migratedDoc = {
     ...legacyAuthFields,
     expires_at: legacyDoc.expires_at || (legacyDoc.exp ? new Date(legacyDoc.exp) : null),
+    refresh_token_expires_at:
+      legacyDoc.refresh_token_expires_at || getRefreshTokenExpiry(authorizedAt),
+    authorized_at: authorizedAt,
     migrated_from_legacy_doc_id: legacyId,
     updated_at: new Date(),
   };
@@ -493,6 +537,10 @@ app.get('/auth/status', asyncRoute(async (req, res) => {
 
   res.status(200).json(buildAuthStatus(authDoc));
 }));
+
+app.get('/config/status', (req, res) => {
+  res.status(200).json(buildConfigStatus());
+});
 
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true });
